@@ -1,0 +1,1 @@
+# Traducao_Imagem
