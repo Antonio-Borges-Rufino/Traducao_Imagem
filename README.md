@@ -333,18 +333,208 @@ else:
   D_A.apply(weights_init_normal)
   D_B.apply(weights_init_normal)
 ```
+7. Inicializando otimizadores
+* O otimizador das redes geradores é compartilhado
+```
+optimizer_G = torch.optim.Adam(
+        itertools.chain(G_AB.parameters(), G_BA.parameters()), lr=lr, betas=(b1, b2)
+    )
+optimizer_D_A = torch.optim.Adam(D_A.parameters(), lr=lr, betas=(b1, b2))
+optimizer_D_B = torch.optim.Adam(D_B.parameters(), lr=lr, betas=(b1, b2))
+```
+8. Inicializa as otimizações dinâmicas das taxas de aprendizado
+* É aqui onde é implementada a função LambdaLR diretamente na função do pytorch
+* Segue o mesmo esquema de compartilhamento entre as redes geradoras
+```
+lr_scheduler_G = torch.optim.lr_scheduler.LambdaLR(
+        optimizer_G, lr_lambda=LambdaLR(n_epochs, epoch, decay_epoch).step
+    )
 
+lr_scheduler_D_A = torch.optim.lr_scheduler.LambdaLR(
+        optimizer_D_A, lr_lambda=LambdaLR(n_epochs, epoch, decay_epoch).step
+    )
 
+lr_scheduler_D_B = torch.optim.lr_scheduler.LambdaLR(
+        optimizer_D_B, lr_lambda=LambdaLR(n_epochs, epoch, decay_epoch).step
+    )
+```
+9. Inicialização da classe ReplayBuffer para guardar imagens já geradas
+```
+fake_A_buffer = ReplayBuffer()
+fake_B_buffer = ReplayBuffer()
+```
+10. Inicialização dos parâmetros de processamento de imagem do pytorch com torchvision
+```
+transforms_ = [
+  transforms.Resize(int(img_height * 1.12), Image.BICUBIC),
+  transforms.RandomCrop((img_height, img_width)),
+  transforms.RandomHorizontalFlip(),
+  transforms.ToTensor(),
+  transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+  ]
+```
+11. Loading das imagens para treinamento e teste
+```
+!unzip /content/data.zip
+```
+```
+# Training data loader
+dataloader = DataLoader(
+  ImageDataset("data/%s" % dataset_name, transforms_=transforms_, unaligned=True),
+  batch_size=batch_size,
+  shuffle=True,
+  num_workers=n_cpu,
+    )
+    # Test data loader
+val_dataloader = DataLoader(
+  ImageDataset("data/%s" % dataset_name, transforms_=transforms_, unaligned=True, mode="test"),
+  batch_size=5,
+  shuffle=True,
+  num_workers=1,
+    )
+```
+12. Função auxiliar para geração de imagens e salvamento das imagens de teste
+```
+def sample_images(batches_done):
+  imgs = next(iter(val_dataloader))
+  G_AB.eval()
+  G_BA.eval()
+  real_A = Variable(imgs["A"].type(Tensor))
+  fake_B = G_AB(real_A)
+  real_B = Variable(imgs["B"].type(Tensor))
+  fake_A = G_BA(real_B)
+  # Arange images along x-axis
+  real_A = make_grid(real_A, nrow=5, normalize=True)
+  real_B = make_grid(real_B, nrow=5, normalize=True)
+  fake_A = make_grid(fake_A, nrow=5, normalize=True)
+  fake_B = make_grid(fake_B, nrow=5, normalize=True)
+  # Arange images along y-axis
+  image_grid = torch.cat((real_A, fake_B, real_B, fake_A), 1)
+  save_image(image_grid, "images/%s/%s.png" % (dataset_name, batches_done), normalize=False)
+```
+13. Looping de treinamento
+```
+prev_time = time.time()
+for epoch in range(epoch, n_epochs):
+  for i, batch in enumerate(dataloader):
+    # Set model input
+    real_A = Variable(batch["A"].type(Tensor))
+    real_B = Variable(batch["B"].type(Tensor))
 
+    # Adversarial ground truths
+    valid = Variable(Tensor(np.ones((real_A.size(0), *D_A.output_shape))), requires_grad=False)
+    fake = Variable(Tensor(np.zeros((real_A.size(0), *D_A.output_shape))), requires_grad=False)
 
+    # ------------------
+    #  Train Generators
+    # ------------------
 
+    G_AB.train()
+    G_BA.train()
 
+    optimizer_G.zero_grad()
 
+    # Identity loss
+    loss_id_A = criterion_identity(G_BA(real_A), real_A)
+    loss_id_B = criterion_identity(G_AB(real_B), real_B)
 
+    loss_identity = (loss_id_A + loss_id_B) / 2
 
+    # GAN loss
+    fake_B = G_AB(real_A)
+    loss_GAN_AB = criterion_GAN(D_B(fake_B), valid)
+    fake_A = G_BA(real_B)
+    loss_GAN_BA = criterion_GAN(D_A(fake_A), valid)
 
+    loss_GAN = (loss_GAN_AB + loss_GAN_BA) / 2
 
+    # Cycle loss
+    recov_A = G_BA(fake_B)
+    loss_cycle_A = criterion_cycle(recov_A, real_A)
+    recov_B = G_AB(fake_A)
+    loss_cycle_B = criterion_cycle(recov_B, real_B)
 
+    loss_cycle = (loss_cycle_A + loss_cycle_B) / 2
+
+    # Total loss
+    loss_G = loss_GAN + lambda_cyc * loss_cycle + lambda_id * loss_identity
+
+    loss_G.backward()
+    optimizer_G.step()
+
+    # -----------------------
+    #  Train Discriminator A
+    # -----------------------
+
+    optimizer_D_A.zero_grad()
+
+    # Real loss
+    loss_real = criterion_GAN(D_A(real_A), valid)
+    # Fake loss (on batch of previously generated samples)
+    fake_A_ = fake_A_buffer.push_and_pop(fake_A)
+    loss_fake = criterion_GAN(D_A(fake_A_.detach()), fake)
+    # Total loss
+    loss_D_A = (loss_real + loss_fake) / 2
+
+    loss_D_A.backward()
+    optimizer_D_A.step()
+
+    # -----------------------
+    #  Train Discriminator B
+    # -----------------------
+
+    optimizer_D_B.zero_grad()
+
+    # Real loss
+    loss_real = criterion_GAN(D_B(real_B), valid)
+    # Fake loss (on batch of previously generated samples)
+    fake_B_ = fake_B_buffer.push_and_pop(fake_B)
+    loss_fake = criterion_GAN(D_B(fake_B_.detach()), fake)
+    # Total loss
+    loss_D_B = (loss_real + loss_fake) / 2
+
+    loss_D_B.backward()
+    optimizer_D_B.step()
+
+    loss_D = (loss_D_A + loss_D_B) / 2
+
+    # --------------
+    #  Log Progress
+    # --------------
+
+    # Determine approximate time left
+    batches_done = epoch * len(dataloader) + i
+    batches_left = n_epochs * len(dataloader) - batches_done
+    time_left = datetime.timedelta(seconds=batches_left * (time.time() - prev_time))
+    prev_time = time.time()
+
+    print("================================")
+    print("Epoch: {}".format(epoch/n_epochs))
+    print("Batch: {}".format(i/len(dataloader)))
+    print("D loss: {}".format(loss_D.item()))
+    print("G loss: {}".format(loss_G.item()))
+    print("adv: {}".format(loss_GAN.item()))
+    print("cycle: {}".format(loss_cycle.item()))
+    print("identity: {}".format(loss_identity.item()))
+    print("ETA: {}".format(time_left))
+
+    # If at sample interval save image
+    if batches_done % sample_interval == 0:
+      sample_images(batches_done)
+    #sys.stdout.write(torch.cuda.memory_summary(device=None, abbreviated=False))
+
+    # Update learning rates
+    lr_scheduler_G.step()
+    lr_scheduler_D_A.step()
+    lr_scheduler_D_B.step()
+
+    if checkpoint_interval != -1 and epoch % checkpoint_interval == 0:
+    # Save model checkpoints
+      torch.save(G_AB.state_dict(), "savedModels/G_AB_%d.pth" % (epoch))
+      torch.save(G_BA.state_dict(), "savedModels/G_BA_%d.pth" % (epoch))
+      torch.save(D_A.state_dict(), "savedModels/D_A_%d.pth" % (epoch))
+      torch.save(D_B.state_dict(), "savedModels/D_B_%d.pth" % (epoch))
+```
 
 
 
